@@ -115,7 +115,7 @@ async fn main() -> Result<(), Error> {
                             let time_diff = SystemTime::now().min(hist.time);
                             let time_diff = time_diff.duration_since(SystemTime::UNIX_EPOCH).expect("Can't convert time_diff to a duration ?");
                             // If depressed within threshold,
-                            if time_diff < Duration::from_millis(threshold as u64) {
+                            if time_diff < threshold_dur {
                                 // filter the release keypress and add to backlog
                                 backlog.push(key_press);
                                 continue;
