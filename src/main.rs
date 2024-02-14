@@ -82,9 +82,13 @@ async fn main() -> Result<(), Error> {
         let ev = if backlog.is_empty() {
             (Some(event_stream.next_event().await.unwrap()), None)
         } else {
+            let wait_for = (backlog[0].time + threshold_dur) // the time in the future
+                .duration_since(current_time) // duration until that time
+                .unwrap_or(Duration::ZERO); // or 0, if the 'future' is in the past
+
             select! {
                 ev = event_stream.next_event() => (Some(ev.unwrap()), None),
-                _ = tokio::time::sleep(current_time.min(backlog[0].time).duration_since(SystemTime::UNIX_EPOCH).expect("5") + threshold_dur) => (None, Some(5)),
+                _ = tokio::time::sleep(wait_for) => (None, Some(5)),
             }
         };
 
