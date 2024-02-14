@@ -1,0 +1,11 @@
+[Unit]
+Description=Keyboard Chatter Fix service
+
+[Service]
+ExecStart=/usr/bin/KeyboardChatterFix
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

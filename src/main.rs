@@ -1,17 +1,14 @@
-use std::any::{Any, TypeId};
 use std::array::from_fn;
 use std::cmp::Ordering;
-use std::fmt::format;
 use std::fs::File;
 use std::io::{Error, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
-use evdev::{AttributeSet, enumerate, EnumerateDevices, EventType, InputEvent, InputEventKind, Key, MiscType, PropType};
+use evdev::{enumerate, EventType, InputEvent, InputEventKind, Key};
 use evdev::uinput::VirtualDeviceBuilder;
 use ini::ini;
-use ringbuffer::{ConstGenericRingBuffer, RingBuffer};
 
 #[derive(PartialEq, Eq)]
 struct KeyPress {
@@ -32,7 +29,6 @@ impl Ord for KeyPress {
 }
 
 fn main() -> Result<(), Error> {
-    use evdev::{Device, Key};
     let mut devices = enumerate();
     let config_path = option_env!("XDG_CONFIG_PATH")
         .map_or_else(||
@@ -53,7 +49,7 @@ fn main() -> Result<(), Error> {
     let threshold = ini["default"]["threshold"].clone().map_or_else(|| { 30 }, |string: String| { string.parse::<u32>().unwrap() });
 
     let (_, mut dev) = devices
-        .find(|(path, dev)| {
+        .find(|(_path, dev)| {
             dev.name().unwrap_or("").contains(kid) &&
                 dev.supported_keys().map_or(false, |keys| { keys.contains(Key::KEY_ENTER) })
         })
@@ -71,16 +67,17 @@ fn main() -> Result<(), Error> {
         println!("Available as {}", path.display());
     }
 
-    let mut pressed_hist: Arc<Mutex<[KeyPress; 0x2e7]>> = Arc::new(Mutex::new(from_fn(|i| {
+    let pressed_hist: Arc<Mutex<[KeyPress; 0x2e7]>> = Arc::new(Mutex::new(from_fn(|i| {
         KeyPress { key: Key(i as u16), time: SystemTime::UNIX_EPOCH }
     })));
-    let mut backlog: Arc<Mutex<Vec<KeyPress>>> = Arc::new(Mutex::new(vec![]));
+    let backlog: Arc<Mutex<Vec<KeyPress>>> = Arc::new(Mutex::new(vec![]));
 
-    let mut backlog2 = backlog.clone();
-    let mut fake_keyboard = Arc::new(Mutex::new(fake_keyboard));
-    let mut fake_keyboard2 = fake_keyboard.clone();
+    let backlog2 = backlog.clone();
+    let fake_keyboard = Arc::new(Mutex::new(fake_keyboard));
+    let fake_keyboard2 = fake_keyboard.clone();
 
     thread::spawn(move || {
+        println!("Started backlog loop.");
         loop {
             thread::sleep(Duration::from_millis(1));
 
@@ -99,8 +96,9 @@ fn main() -> Result<(), Error> {
         }
     });
 
+    dev.grab().expect("Could not grab (take full control of) your device");
+    println!("Started main event loop.");
     loop {
-        dev.grab().expect("Could not grab (take full control of) your device");
         for ev in dev.fetch_events().unwrap() {
             match ev.kind() {
                 InputEventKind::Key(key) => {
@@ -119,6 +117,7 @@ fn main() -> Result<(), Error> {
                         let pos = mutable_backlog.iter().position(|key_press: &KeyPress| { key_press.key == key });
                         if let Some(pos) = pos {
                             mutable_backlog.remove(pos);
+                            println!("Chatter prevented.");
                         }
 
                     } else {
@@ -135,7 +134,6 @@ fn main() -> Result<(), Error> {
                     // Events that occurred normally (outside threshold) are just emitted
                     let mut fake_keyboard = fake_keyboard.lock().unwrap();
                     fake_keyboard.emit(&[ev]).expect("Could not emit keypress");
-                    println!("{ev:?}");
                 }
                 _ => {}
             }
