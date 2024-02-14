@@ -3,12 +3,11 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{Error, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, SystemTime};
 use evdev::{enumerate, EventType, InputEvent, InputEventKind, Key};
 use evdev::uinput::VirtualDeviceBuilder;
 use ini::ini;
+use tokio::select;
 
 #[derive(PartialEq, Eq)]
 struct KeyPress {
@@ -28,7 +27,8 @@ impl Ord for KeyPress {
     }
 }
 
-fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<(), Error> {
     let mut devices = enumerate();
     let config_path = option_env!("XDG_CONFIG_PATH")
         .map_or_else(||
@@ -47,6 +47,7 @@ fn main() -> Result<(), Error> {
     let binding = ini["default"]["id"].clone().unwrap_or(String::new());
     let kid = binding.as_str();
     let threshold = ini["default"]["threshold"].clone().map_or_else(|| { 30 }, |string: String| { string.parse::<u32>().unwrap() });
+    let threshold_dur = Duration::from_millis(threshold as u64);
 
     let (_, mut dev) = devices
         .find(|(_path, dev)| {
@@ -67,76 +68,71 @@ fn main() -> Result<(), Error> {
         println!("Available as {}", path.display());
     }
 
-    let pressed_hist: Arc<Mutex<[KeyPress; 0x2e7]>> = Arc::new(Mutex::new(from_fn(|i| {
+    let mut pressed_hist: [KeyPress; 0x2e7] = from_fn(|i| {
         KeyPress { key: Key(i as u16), time: SystemTime::UNIX_EPOCH }
-    })));
-    let backlog: Arc<Mutex<Vec<KeyPress>>> = Arc::new(Mutex::new(vec![]));
-
-    let backlog2 = backlog.clone();
-    let fake_keyboard = Arc::new(Mutex::new(fake_keyboard));
-    let fake_keyboard2 = fake_keyboard.clone();
-
-    thread::spawn(move || {
-        println!("Started backlog loop.");
-        loop {
-            thread::sleep(Duration::from_millis(1));
-
-            // Find item that has been backlogged for at least 30ms
-            let mut mutable_backlog = backlog2.lock().unwrap();
-            let pos = mutable_backlog.iter().position(|el| { el.time < (SystemTime::now() - Duration::from_millis(threshold as u64)) });
-            if let Some(pos) = pos {
-                let old_backlog_item = &mutable_backlog[pos];
-
-
-                // Emit found item
-                let mut fake_keyboard = fake_keyboard2.lock().unwrap();
-                fake_keyboard.emit(&[InputEvent::new(EventType::KEY, old_backlog_item.key.0, 0)]).expect("Could not emit key release");
-                mutable_backlog.remove(pos);
-            }
-        }
     });
+    let mut backlog: Vec<KeyPress> = vec![];
 
     dev.grab().expect("Could not grab (take full control of) your device");
     println!("Started main event loop.");
+    let mut event_stream = dev.into_event_stream()?;
     loop {
-        for ev in dev.fetch_events().unwrap() {
-            match ev.kind() {
-                InputEventKind::Key(key) => {
-                    let key_press = KeyPress { key, time: ev.timestamp() };
-                    let pressed = ev.value() == 1;
-                    let idx = key.clone().0 as usize;
+        let current_time = SystemTime::now();
 
-                    let mut pressed_hist = pressed_hist.lock().unwrap();
-                    let hist = &pressed_hist[idx];
-                    if pressed {
-                        // Add key to press history
-                        pressed_hist[idx] = key_press;
-                        let mut mutable_backlog = backlog.lock().unwrap();
-
-                        // Remove key from backlog
-                        let pos = mutable_backlog.iter().position(|key_press: &KeyPress| { key_press.key == key });
-                        if let Some(pos) = pos {
-                            mutable_backlog.remove(pos);
-                            println!("Chatter prevented.");
-                        }
-
-                    } else {
-                        let time_diff = SystemTime::now().min(hist.time);
-                        let time_diff = time_diff.duration_since(SystemTime::UNIX_EPOCH).expect("Can't convert time_diff to a duration ?");
-                        if time_diff < Duration::from_millis(threshold as u64) {
-                            // If depressed within threshold, filter the release keypress and add to backlog
-                            let mut mutable_backlog = backlog.lock().unwrap();
-                            mutable_backlog.push(key_press);
-                            continue;
-                        }
-                    }
-
-                    // Events that occurred normally (outside threshold) are just emitted
-                    let mut fake_keyboard = fake_keyboard.lock().unwrap();
-                    fake_keyboard.emit(&[ev]).expect("Could not emit keypress");
-                }
-                _ => {}
+        let ev = if backlog.is_empty() {
+            (Some(event_stream.next_event().await.unwrap()), None)
+        } else {
+            select! {
+                ev = event_stream.next_event() => (Some(ev.unwrap()), None),
+                _ = tokio::time::sleep(current_time.min(backlog[0].time).duration_since(SystemTime::UNIX_EPOCH).expect("5") + threshold_dur) => (None, Some(5)),
             }
-        }
+        };
+
+        match ev {
+            (Some(ev), None) => {
+                match ev.kind() {
+                    InputEventKind::Key(key) => {
+                        let key_press = KeyPress { key, time: ev.timestamp() };
+                        let pressed = ev.value() == 1;
+                        let idx = key.clone().0 as usize;
+
+                        let hist = &pressed_hist[idx];
+                        if pressed {
+                            // Add key to press history
+                            pressed_hist[idx] = key_press;
+
+                            // Remove key from backlog
+                            let pos = backlog.iter().position(|key_press: &KeyPress| { key_press.key == key });
+                            if let Some(pos) = pos {
+                                backlog.remove(pos);
+                                println!("Chatter prevented.");
+                            }
+                        } else {
+                            let time_diff = SystemTime::now().min(hist.time);
+                            let time_diff = time_diff.duration_since(SystemTime::UNIX_EPOCH).expect("Can't convert time_diff to a duration ?");
+                            // If depressed within threshold,
+                            if time_diff < Duration::from_millis(threshold as u64) {
+                                // filter the release keypress and add to backlog
+                                backlog.push(key_press);
+                                continue;
+                            }
+                        }
+
+                        // Events that occurred normally (outside threshold) are just emitted
+                        fake_keyboard.emit(&[ev]).expect("Could not emit keypress");
+                    }
+                    _ => {}
+                }
+            },
+            (None, Some(5)) => {
+                // Find item that has been backlogged for at least 30ms
+                let old_backlog_item = &backlog[0];
+
+                // Emit found item
+                fake_keyboard.emit(&[InputEvent::new(EventType::KEY, old_backlog_item.key.0, 0)]).expect("Could not emit key release");
+                backlog.remove(0);
+            },
+            _ => unreachable!()
+        };
     }
 }
