@@ -74,7 +74,6 @@ async fn main() -> Result<(), Error> {
 
         match ev {
             Some(ev) if let EventSummary::Key(_key_ev, key, _value) = ev.destructure() => {
-                println!("Received Key: {:?}", key);
                 let key_press = KeyPress {
                     key,
                     time: ev.timestamp(),
